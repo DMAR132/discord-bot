@@ -114,24 +114,57 @@ async function isTwitchLive(login) {
   return Array.isArray(json.data) && json.data.length > 0;
 }
 
-// ✅ Kick (أفضل) — نستخدم api/v1 ونفحص livestream.is_live
+// ✅ Kick — قوي جدًا:
+// 1) نجرب API v1
+// 2) إذا رجّع livestream null (غالبًا يصير غلط) نعمل fallback نفحص صفحة القناة ونبحث عن "is_live":true
 async function isKickLive(username) {
+  const u = String(username || "").trim().toLowerCase();
+  if (!u) return false;
+
+  // 1) API
   try {
-    const url = `https://kick.com/api/v1/channels/${encodeURIComponent(username)}`;
-    const res = await fetch(url, {
+    const apiUrl = `https://kick.com/api/v1/channels/${encodeURIComponent(u)}`;
+    const res = await fetch(apiUrl, {
       headers: {
         "Accept": "application/json, text/plain, */*",
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": "Mozilla/5.0",
       },
     });
-    if (!res.ok) return false;
 
-    const json = await res.json();
-    // حسب الداتا: livestream.is_live أو recent_livestream.is_live
-    const live1 = json?.livestream?.is_live === true;
-    const live2 = json?.recent_livestream?.is_live === true;
+    if (res.ok) {
+      const json = await res.json();
 
-    return live1 || live2;
+      // إذا livestream موجود => اعتبره لايف (حتى لو is_live مو موجود أحيانًا)
+      if (json?.livestream !== null && json?.livestream !== undefined) {
+        if (json?.livestream?.is_live === false) {
+          // لو صريحة false
+          return false;
+        }
+        return true;
+      }
+
+      // بعض الأحيان موجودة هنا
+      if (json?.recent_livestream?.is_live === true) return true;
+    }
+  } catch (e) {
+    // نكمل للفولباك
+  }
+
+  // 2) Fallback: HTML page check
+  try {
+    const pageUrl = `https://kick.com/${encodeURIComponent(u)}`;
+    const res2 = await fetch(pageUrl, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
+    if (!res2.ok) return false;
+
+    const html = await res2.text();
+
+    // نبحث عن is_live true داخل الصفحة
+    // (Kick يضمنها غالبًا ضمن الداتا)
+    if (html.includes(`"is_live":true`)) return true;
+
+    return false;
   } catch {
     return false;
   }
@@ -326,7 +359,7 @@ client.once("ready", async () => {
     const channel = await client.channels.fetch(usedChannelId).catch(() => null);
     if (channel) {
       update(channel).catch(console.error);
-      setInterval(() => update(channel).catch(console.error), INTERVAL_MS);
+      setInterval(() => update(channel).catch(console.error), INTERVAL_MS); // ✅ كل 5 ثواني
     } else {
       console.log("❌ CHANNEL_ID غلط أو ما عنده صلاحية");
     }
