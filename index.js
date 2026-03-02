@@ -2,40 +2,63 @@ require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
-const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
 
-// ✅ من Render Environment
-const CHANNEL_ID = process.env.CHANNEL_ID;
+const {
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+} = require("discord.js");
+
+// ====== ENV ======
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
+let CHANNEL_ID = process.env.CHANNEL_ID; // ممكن يتغير عبر /setchannel
+const GUILD_ID = process.env.GUILD_ID;   // اختياري لتسجيل الأوامر فورًا
+
 const INTERVAL_MS = Number(process.env.INTERVAL_MS || 5000);
-
-// ✅ يقرأها من Render مثل: shroud,xqc,foo
-function parseList(v) {
-  return (v || "")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean);
-}
-const TWITCH_LOGINS = parseList(process.env.TWITCH_LOGINS);
-const KICK_LOGINS = parseList(process.env.KICK_LOGINS);
-
 const STATE_FILE = path.join(__dirname, "state.json");
 
+// ====== State ======
 function loadState() {
   try {
     if (!fs.existsSync(STATE_FILE)) {
-      const init = { messageId: null, lastLiveKeys: [], counts: { twitch: 0, kick: 0 } };
+      const init = {
+        messageId: null,
+        lastLiveKeys: [],
+        counts: { twitch: 0, kick: 0 },
+        streamers: { twitch: [], kick: [] },  // ✅ القوائم صارت هنا
+        channelId: CHANNEL_ID || null,        // ✅ نخزن الروم
+      };
       fs.writeFileSync(STATE_FILE, JSON.stringify(init, null, 2));
       return init;
     }
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    const st = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+
+    // ترقيع لو state قديم
+    st.counts ||= { twitch: 0, kick: 0 };
+    st.lastLiveKeys ||= [];
+    st.streamers ||= { twitch: [], kick: [] };
+    st.channelId ||= CHANNEL_ID || null;
+
+    return st;
   } catch {
-    return { messageId: null, lastLiveKeys: [], counts: { twitch: 0, kick: 0 } };
+    return {
+      messageId: null,
+      lastLiveKeys: [],
+      counts: { twitch: 0, kick: 0 },
+      streamers: { twitch: [], kick: [] },
+      channelId: CHANNEL_ID || null,
+    };
   }
 }
 function saveState(st) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(st, null, 2));
 }
 const state = loadState();
+if (!CHANNEL_ID && state.channelId) CHANNEL_ID = state.channelId;
 
 // ===== Twitch token cache =====
 let twitchToken = null;
@@ -94,6 +117,7 @@ function buildLine(platform, login) {
     ? `https://twitch.tv/${login}`
     : `https://kick.com/${login}`;
 
+  // ✅ بدون رابط كامل
   return `**${login}** — [اضغط هنا](${url})`;
 }
 
@@ -114,6 +138,9 @@ async function update(channel) {
   const liveTwitch = [];
   const liveKick = [];
 
+  const TWITCH_LOGINS = state.streamers.twitch || [];
+  const KICK_LOGINS = state.streamers.kick || [];
+
   // Twitch
   for (const login of TWITCH_LOGINS) {
     const live = await isTwitchLive(login);
@@ -121,7 +148,6 @@ async function update(channel) {
 
     const key = `twitch:${login}`;
     currentLiveKeys.add(key);
-
     liveTwitch.push(buildLine("twitch", login));
 
     if (!state.lastLiveKeys.includes(key)) {
@@ -136,7 +162,6 @@ async function update(channel) {
 
     const key = `kick:${login}`;
     currentLiveKeys.add(key);
-
     liveKick.push(buildLine("kick", login));
 
     if (!state.lastLiveKeys.includes(key)) {
@@ -183,28 +208,173 @@ async function update(channel) {
   }
 }
 
+// ===== Slash Commands =====
+async function registerCommands() {
+  if (!DISCORD_CLIENT_ID) {
+    console.log("❌ ناقص DISCORD_CLIENT_ID في Render Environment");
+    return;
+  }
+
+  const commands = [
+    new SlashCommandBuilder()
+      .setName("add")
+      .setDescription("إضافة ستريمر (Twitch/Kick)")
+      .addStringOption(o =>
+        o.setName("platform")
+          .setDescription("twitch أو kick")
+          .setRequired(true)
+          .addChoices(
+            { name: "twitch", value: "twitch" },
+            { name: "kick", value: "kick" }
+          ))
+      .addStringOption(o =>
+        o.setName("login")
+          .setDescription("اسم القناة (بدون رابط)")
+          .setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName("remove")
+      .setDescription("حذف ستريمر (Twitch/Kick)")
+      .addStringOption(o =>
+        o.setName("platform")
+          .setDescription("twitch أو kick")
+          .setRequired(true)
+          .addChoices(
+            { name: "twitch", value: "twitch" },
+            { name: "kick", value: "kick" }
+          ))
+      .addStringOption(o =>
+        o.setName("login")
+          .setDescription("اسم القناة")
+          .setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName("list")
+      .setDescription("عرض قائمة الستريمرز المسجلين"),
+
+    new SlashCommandBuilder()
+      .setName("setchannel")
+      .setDescription("تحديد الروم اللي ينزل فيه الإشعار")
+      .addStringOption(o =>
+        o.setName("channel_id")
+          .setDescription("آيدي الروم")
+          .setRequired(true)),
+
+    new SlashCommandBuilder()
+      .setName("forceupdate")
+      .setDescription("تحديث الإشعار الآن"),
+  ].map(c => c.toJSON());
+
+  const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
+
+  if (GUILD_ID) {
+    await rest.put(
+      Routes.applicationGuildCommands(DISCORD_CLIENT_ID, GUILD_ID),
+      { body: commands }
+    );
+    console.log("✅ تم تسجيل أوامر السلاش للسيرفر (Guild) فورًا");
+  } else {
+    await rest.put(
+      Routes.applicationCommands(DISCORD_CLIENT_ID),
+      { body: commands }
+    );
+    console.log("✅ تم تسجيل أوامر السلاش (Global) (قد تتأخر بالظهور)");
+  }
+}
+
+// ===== Discord Client =====
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 client.once("ready", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 
-  if (!process.env.DISCORD_TOKEN) {
+  if (!DISCORD_TOKEN) {
     console.log("❌ ناقص DISCORD_TOKEN");
     process.exit(1);
   }
-  if (!CHANNEL_ID) {
-    console.log("❌ ناقص CHANNEL_ID");
-    process.exit(1);
+  if (!CHANNEL_ID && !state.channelId) {
+    console.log("❌ ناقص CHANNEL_ID (أو استخدم /setchannel)");
   }
 
-  const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
-  if (!channel) {
-    console.log("❌ CHANNEL_ID غلط أو ما عنده صلاحية");
-    process.exit(1);
-  }
+  await registerCommands().catch(console.error);
 
-  update(channel).catch(console.error);
-  setInterval(() => update(channel).catch(console.error), INTERVAL_MS);
+  const usedChannelId = state.channelId || CHANNEL_ID;
+  if (usedChannelId) {
+    const channel = await client.channels.fetch(usedChannelId).catch(() => null);
+    if (channel) {
+      update(channel).catch(console.error);
+      setInterval(() => update(channel).catch(console.error), INTERVAL_MS);
+    } else {
+      console.log("❌ CHANNEL_ID غلط أو ما عنده صلاحية");
+    }
+  } else {
+    // ما في روم محدد—البوت ينتظر /setchannel
+    setInterval(() => {}, 60_000);
+  }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const cmd = interaction.commandName;
+
+  if (cmd === "add") {
+    const platform = interaction.options.getString("platform", true);
+    const loginRaw = interaction.options.getString("login", true);
+    const login = loginRaw.trim().replace(/^@/, "").replace(/\s+/g, "");
+
+    const arr = state.streamers[platform] || (state.streamers[platform] = []);
+    if (arr.includes(login)) {
+      return interaction.reply({ content: `⚠️ موجود من قبل: **${login}** على ${platform}`, ephemeral: true });
+    }
+    arr.push(login);
+    saveState(state);
+
+    return interaction.reply({ content: `✅ تمت الإضافة: **${login}** على ${platform}`, ephemeral: true });
+  }
+
+  if (cmd === "remove") {
+    const platform = interaction.options.getString("platform", true);
+    const loginRaw = interaction.options.getString("login", true);
+    const login = loginRaw.trim().replace(/^@/, "").replace(/\s+/g, "");
+
+    const arr = state.streamers[platform] || [];
+    const idx = arr.indexOf(login);
+    if (idx === -1) {
+      return interaction.reply({ content: `⚠️ غير موجود: **${login}** على ${platform}`, ephemeral: true });
+    }
+    arr.splice(idx, 1);
+    saveState(state);
+
+    return interaction.reply({ content: `✅ تم الحذف: **${login}** من ${platform}`, ephemeral: true });
+  }
+
+  if (cmd === "list") {
+    const t = (state.streamers.twitch || []).join(", ") || "—";
+    const k = (state.streamers.kick || []).join(", ") || "—";
+    return interaction.reply({
+      content: `**Twitch:** ${t}\n**Kick:** ${k}`,
+      ephemeral: true
+    });
+  }
+
+  if (cmd === "setchannel") {
+    const chId = interaction.options.getString("channel_id", true).trim();
+    state.channelId = chId;
+    state.messageId = null; // عشان يرسل رسالة جديدة في الروم الجديد
+    saveState(state);
+
+    return interaction.reply({ content: `✅ تم تحديد الروم: \`${chId}\``, ephemeral: true });
+  }
+
+  if (cmd === "forceupdate") {
+    const usedChannelId = state.channelId || CHANNEL_ID;
+    const channel = await client.channels.fetch(usedChannelId).catch(() => null);
+    if (!channel) return interaction.reply({ content: "❌ ما لقيت الروم. تأكد من CHANNEL_ID أو /setchannel", ephemeral: true });
+
+    update(channel).catch(console.error);
+    return interaction.reply({ content: "✅ تم التحديث الآن.", ephemeral: true });
+  }
+});
+
+client.login(DISCORD_TOKEN);
