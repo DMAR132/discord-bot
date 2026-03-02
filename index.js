@@ -142,7 +142,6 @@ async function isKickLive(username) {
     if (res.ok) {
       const json = await res.json();
 
-      // livestream موجود => غالبًا لايف
       if (json?.livestream !== null && json?.livestream !== undefined) {
         if (json?.livestream?.is_live === false) return false;
         return true;
@@ -350,6 +349,16 @@ client.once("ready", async () => {
   }
 });
 
+// ✅ reply helper (fix 10062)
+async function safeReply(interaction, payload) {
+  try {
+    if (interaction.deferred || interaction.replied) return await interaction.editReply(payload);
+    return await interaction.reply(payload);
+  } catch {
+    return null;
+  }
+}
+
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
@@ -364,11 +373,12 @@ client.on("interactionCreate", async (interaction) => {
 
     const arr = state.streamers[platform] || (state.streamers[platform] = []);
     if (arr.includes(login)) {
-      return interaction.editReply(`⚠️ موجود من قبل: **${login}** على ${platform}`);
+      return safeReply(interaction, { content: `⚠️ موجود من قبل: **${login}** على ${platform}`, ephemeral: true });
     }
+
     arr.push(login);
     saveState(state);
-    return interaction.editReply(`✅ تمت الإضافة: **${login}** على ${platform}\nجرّب الآن: /forceupdate`);
+    return safeReply(interaction, { content: `✅ تمت الإضافة: **${login}** على ${platform}\nجرّب الآن: /forceupdate`, ephemeral: true });
   }
 
   if (cmd === "remove") {
@@ -381,17 +391,18 @@ client.on("interactionCreate", async (interaction) => {
     const arr = state.streamers[platform] || [];
     const idx = arr.indexOf(login);
     if (idx === -1) {
-      return interaction.editReply(`⚠️ غير موجود: **${login}** على ${platform}`);
+      return safeReply(interaction, { content: `⚠️ غير موجود: **${login}** على ${platform}`, ephemeral: true });
     }
+
     arr.splice(idx, 1);
     saveState(state);
-    return interaction.editReply(`✅ تم الحذف: **${login}** من ${platform}`);
+    return safeReply(interaction, { content: `✅ تم الحذف: **${login}** من ${platform}`, ephemeral: true });
   }
 
   if (cmd === "list") {
     const t = (state.streamers.twitch || []).join(", ") || "—";
     const k = (state.streamers.kick || []).join(", ") || "—";
-    return interaction.reply({ content: `**Twitch:** ${t}\n**Kick:** ${k}`, ephemeral: true });
+    return safeReply(interaction, { content: `**Twitch:** ${t}\n**Kick:** ${k}`, ephemeral: true });
   }
 
   if (cmd === "setchannel") {
@@ -399,7 +410,7 @@ client.on("interactionCreate", async (interaction) => {
     state.channelId = chId;
     state.messageId = null;
     saveState(state);
-    return interaction.reply({ content: `✅ تم تحديد الروم: \`${chId}\``, ephemeral: true });
+    return safeReply(interaction, { content: `✅ تم تحديد الروم: \`${chId}\``, ephemeral: true });
   }
 
   if (cmd === "forceupdate") {
@@ -407,10 +418,10 @@ client.on("interactionCreate", async (interaction) => {
 
     const usedChannelId = state.channelId || CHANNEL_ID;
     const channel = await client.channels.fetch(usedChannelId).catch(() => null);
-    if (!channel) return interaction.editReply("❌ ما لقيت الروم. تأكد من CHANNEL_ID أو /setchannel");
+    if (!channel) return safeReply(interaction, { content: "❌ ما لقيت الروم. تأكد من CHANNEL_ID أو /setchannel", ephemeral: true });
 
     await update(channel).catch(console.error);
-    return interaction.editReply("✅ تم التحديث الآن.");
+    return safeReply(interaction, { content: "✅ تم التحديث الآن.", ephemeral: true });
   }
 });
 
