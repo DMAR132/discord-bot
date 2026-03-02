@@ -124,11 +124,12 @@ async function isTwitchLive(login) {
   return Array.isArray(json.data) && json.data.length > 0;
 }
 
-// ✅ Kick: API then HTML fallback
+// ✅ Kick: API then stronger HTML fallback
 async function isKickLive(username) {
   const u = String(username || "").trim().toLowerCase();
   if (!u) return false;
 
+  // 1) API
   try {
     const apiUrl = `https://kick.com/api/v1/channels/${encodeURIComponent(u)}`;
     const res = await fetch(apiUrl, {
@@ -140,20 +141,29 @@ async function isKickLive(username) {
 
     if (res.ok) {
       const json = await res.json();
+
+      // livestream موجود => غالبًا لايف
       if (json?.livestream !== null && json?.livestream !== undefined) {
         if (json?.livestream?.is_live === false) return false;
         return true;
       }
+
       if (json?.recent_livestream?.is_live === true) return true;
     }
   } catch {}
 
+  // 2) HTML fallback (regex قوي)
   try {
     const pageUrl = `https://kick.com/${encodeURIComponent(u)}`;
     const res2 = await fetch(pageUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
     if (!res2.ok) return false;
+
     const html = await res2.text();
-    return html.includes(`"is_live":true`);
+
+    if (/\"is_live\"\s*:\s*true/i.test(html)) return true;
+    if (/\"livestream\"\s*:\s*\{/i.test(html)) return true;
+
+    return false;
   } catch {
     return false;
   }
@@ -178,19 +188,15 @@ function chunkIfTooLong(lines) {
 
 // ✅ Find the ONE message (never create new unless truly missing)
 async function getOrCreateSingleMessage(channel) {
-  // 1) try fetch saved message
   if (state.messageId) {
     const msg = await channel.messages.fetch(state.messageId).catch(() => null);
     if (msg) return msg;
   }
 
-  // 2) try find last bot message with embed title
   const recent = await channel.messages.fetch({ limit: 20 }).catch(() => null);
   if (recent) {
     const found = recent.find(
-      (m) =>
-        m.author?.id === channel.client.user.id &&
-        m.embeds?.[0]?.title === "⭐ ستريمر بلادي"
+      (m) => m.author?.id === channel.client.user.id && m.embeds?.[0]?.title === "⭐ ستريمر بلادي"
     );
     if (found) {
       state.messageId = found.id;
@@ -199,7 +205,6 @@ async function getOrCreateSingleMessage(channel) {
     }
   }
 
-  // 3) create once if not found
   const created = await channel.send({ content: "⏳ جاري التحضير..." }).catch(() => null);
   if (created) {
     state.messageId = created.id;
@@ -285,9 +290,7 @@ async function registerCommands() {
             { name: "kick", value: "kick" }
           )
       )
-      .addStringOption((o) =>
-        o.setName("login").setDescription("اسم القناة فقط (بدون رابط)").setRequired(true)
-      ),
+      .addStringOption((o) => o.setName("login").setDescription("اسم القناة فقط (بدون رابط)").setRequired(true)),
 
     new SlashCommandBuilder()
       .setName("remove")
@@ -353,20 +356,24 @@ client.on("interactionCreate", async (interaction) => {
   const cmd = interaction.commandName;
 
   if (cmd === "add") {
+    await interaction.deferReply({ ephemeral: true });
+
     const platform = interaction.options.getString("platform", true);
     const loginRaw = interaction.options.getString("login", true);
     const login = loginRaw.trim().replace(/^@/, "").replace(/\s+/g, "").toLowerCase();
 
     const arr = state.streamers[platform] || (state.streamers[platform] = []);
     if (arr.includes(login)) {
-      return interaction.reply({ content: `⚠️ موجود من قبل: **${login}** على ${platform}`, ephemeral: true });
+      return interaction.editReply(`⚠️ موجود من قبل: **${login}** على ${platform}`);
     }
     arr.push(login);
     saveState(state);
-    return interaction.reply({ content: `✅ تمت الإضافة: **${login}** على ${platform}\nجرّب الآن: /forceupdate`, ephemeral: true });
+    return interaction.editReply(`✅ تمت الإضافة: **${login}** على ${platform}\nجرّب الآن: /forceupdate`);
   }
 
   if (cmd === "remove") {
+    await interaction.deferReply({ ephemeral: true });
+
     const platform = interaction.options.getString("platform", true);
     const loginRaw = interaction.options.getString("login", true);
     const login = loginRaw.trim().replace(/^@/, "").replace(/\s+/g, "").toLowerCase();
@@ -374,11 +381,11 @@ client.on("interactionCreate", async (interaction) => {
     const arr = state.streamers[platform] || [];
     const idx = arr.indexOf(login);
     if (idx === -1) {
-      return interaction.reply({ content: `⚠️ غير موجود: **${login}** على ${platform}`, ephemeral: true });
+      return interaction.editReply(`⚠️ غير موجود: **${login}** على ${platform}`);
     }
     arr.splice(idx, 1);
     saveState(state);
-    return interaction.reply({ content: `✅ تم الحذف: **${login}** من ${platform}`, ephemeral: true });
+    return interaction.editReply(`✅ تم الحذف: **${login}** من ${platform}`);
   }
 
   if (cmd === "list") {
@@ -390,19 +397,20 @@ client.on("interactionCreate", async (interaction) => {
   if (cmd === "setchannel") {
     const chId = interaction.options.getString("channel_id", true).trim();
     state.channelId = chId;
-    state.messageId = null; // ✅ رح يعيد يلقط/ينشئ رسالة وحدة في هذا الروم
+    state.messageId = null;
     saveState(state);
     return interaction.reply({ content: `✅ تم تحديد الروم: \`${chId}\``, ephemeral: true });
   }
 
   if (cmd === "forceupdate") {
+    await interaction.deferReply({ ephemeral: true });
+
     const usedChannelId = state.channelId || CHANNEL_ID;
     const channel = await client.channels.fetch(usedChannelId).catch(() => null);
-    if (!channel) {
-      return interaction.reply({ content: "❌ ما لقيت الروم. تأكد من CHANNEL_ID أو /setchannel", ephemeral: true });
-    }
+    if (!channel) return interaction.editReply("❌ ما لقيت الروم. تأكد من CHANNEL_ID أو /setchannel");
+
     await update(channel).catch(console.error);
-    return interaction.reply({ content: "✅ تم التحديث الآن.", ephemeral: true });
+    return interaction.editReply("✅ تم التحديث الآن.");
   }
 });
 
