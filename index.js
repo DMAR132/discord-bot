@@ -16,7 +16,6 @@ if (!DISCORD_CLIENT_ID) {
 let CHANNEL_ID = process.env.CHANNEL_ID;
 const GUILD_ID = process.env.GUILD_ID;
 
-// ✅ خفّف التحديثات لتجنب RateLimit
 const INTERVAL_MS = Number(process.env.INTERVAL_MS || 30000);
 
 const EMBED_THUMBNAIL_URL =
@@ -43,6 +42,39 @@ const {
   Routes,
   SlashCommandBuilder,
 } = require("discord.js");
+
+// ====== crash protection (fix 10062 causing crash) ======
+process.on("unhandledRejection", (err) => {
+  const code = err?.code || err?.rawError?.code;
+  if (code === 10062) return; // Unknown interaction
+  console.error(err);
+});
+process.on("uncaughtException", (err) => {
+  const code = err?.code || err?.rawError?.code;
+  if (code === 10062) return;
+  console.error(err);
+});
+
+// ====== helpers ======
+async function safeDefer(interaction, opts = { ephemeral: true }) {
+  try {
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferReply(opts);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function safeReply(interaction, payload) {
+  try {
+    if (interaction.deferred || interaction.replied) return await interaction.editReply(payload);
+    return await interaction.reply(payload);
+  } catch {
+    return null;
+  }
+}
 
 const STATE_FILE = path.join(__dirname, "state.json");
 
@@ -78,7 +110,9 @@ function loadState() {
   }
 }
 function saveState(st) {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(st, null, 2));
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify(st, null, 2));
+  } catch {}
 }
 
 const state = loadState();
@@ -349,23 +383,13 @@ client.once("ready", async () => {
   }
 });
 
-// ✅ reply helper (fix 10062)
-async function safeReply(interaction, payload) {
-  try {
-    if (interaction.deferred || interaction.replied) return await interaction.editReply(payload);
-    return await interaction.reply(payload);
-  } catch {
-    return null;
-  }
-}
-
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   const cmd = interaction.commandName;
 
   if (cmd === "add") {
-    await interaction.deferReply({ ephemeral: true });
+    await safeDefer(interaction, { ephemeral: true });
 
     const platform = interaction.options.getString("platform", true);
     const loginRaw = interaction.options.getString("login", true);
@@ -382,7 +406,7 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   if (cmd === "remove") {
-    await interaction.deferReply({ ephemeral: true });
+    await safeDefer(interaction, { ephemeral: true });
 
     const platform = interaction.options.getString("platform", true);
     const loginRaw = interaction.options.getString("login", true);
@@ -414,7 +438,7 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   if (cmd === "forceupdate") {
-    await interaction.deferReply({ ephemeral: true });
+    await safeDefer(interaction, { ephemeral: true });
 
     const usedChannelId = state.channelId || CHANNEL_ID;
     const channel = await client.channels.fetch(usedChannelId).catch(() => null);
