@@ -1,6 +1,6 @@
 require("dotenv").config();
 
-// ✅ Web server بسيط عشان Render ما يعمل Timeout (Web Service يحتاج PORT)
+// ✅ Web server بسيط عشان Render Web Service ما يعمل Timeout (لازم PORT)
 const express = require("express");
 const app = express();
 app.get("/", (req, res) => res.send("Bot is running"));
@@ -10,6 +10,8 @@ app.listen(process.env.PORT || 3000, () => {
 
 const fs = require("fs");
 const path = require("path");
+
+// node-fetch v3 (ESM) => dynamic import
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
 const {
@@ -24,18 +26,16 @@ const {
 // ====== ENV ======
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
-let CHANNEL_ID = process.env.CHANNEL_ID; // ممكن يتغير عبر /setchannel
-const GUILD_ID = process.env.GUILD_ID;   // اختياري لتسجيل الأوامر فورًا
 
-// ✅ ثابت: تحديث كل 5 ثواني
-const INTERVAL_MS = 5000;
+let CHANNEL_ID = process.env.CHANNEL_ID; // ممكن يتغير عبر /setchannel
+const GUILD_ID = process.env.GUILD_ID;   // إذا حطيته الأوامر بتظهر فورًا
+
+const INTERVAL_MS = Number(process.env.INTERVAL_MS || 5000); // ✅ كل 5 ثواني
+const EMBED_THUMBNAIL_URL =
+  process.env.EMBED_THUMBNAIL_URL ||
+  "https://media.discordapp.net/attachments/1287093908437729374/1478099307210215556/ChatGPT_Image_13_2026_12_40_56_.png?format=webp&quality=lossless&width=968&height=968";
 
 const STATE_FILE = path.join(__dirname, "state.json");
-
-// ✅ الصورة يمين فوق (Thumbnail)
-const THUMB_URL =
-  process.env.LOGO_URL ||
-  "https://media.discordapp.net/attachments/1287093908437729374/1478099307210215556/ChatGPT_Image_13_2026_12_40_56_.png?ex=69a72ac0&is=69a5d940&hm=5069ff615a415c8beb6c98949880c1bb873bb03e30711f64c17cce40066de35f&=&format=webp&quality=lossless&width=968&height=968";
 
 // ====== State ======
 function loadState() {
@@ -70,6 +70,7 @@ function loadState() {
 function saveState(st) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(st, null, 2));
 }
+
 const state = loadState();
 if (!CHANNEL_ID && state.channelId) CHANNEL_ID = state.channelId;
 
@@ -105,27 +106,32 @@ async function isTwitchLive(login) {
   const res = await fetch(url.toString(), {
     headers: {
       "Client-ID": process.env.TWITCH_CLIENT_ID,
-      Authorization: `Bearer ${token}`,
+      "Authorization": `Bearer ${token}`,
     },
   });
   if (!res.ok) return false;
-
   const json = await res.json();
   return Array.isArray(json.data) && json.data.length > 0;
 }
 
-// ✅ Kick (غير رسمي) + User-Agent عشان ما يرفض
-async function isKickLive(channel) {
+// ✅ Kick (أفضل) — نستخدم api/v1 ونفحص livestream.is_live
+async function isKickLive(username) {
   try {
-    const res = await fetch(`https://kick.com/api/v2/channels/${encodeURIComponent(channel)}`, {
+    const url = `https://kick.com/api/v1/channels/${encodeURIComponent(username)}`;
+    const res = await fetch(url, {
       headers: {
-        "User-Agent": "Mozilla/5.0",
-        Accept: "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0"
       },
     });
     if (!res.ok) return false;
+
     const json = await res.json();
-    return !!json?.livestream;
+    // حسب الداتا: livestream.is_live أو recent_livestream.is_live
+    const live1 = json?.livestream?.is_live === true;
+    const live2 = json?.recent_livestream?.is_live === true;
+
+    return live1 || live2;
   } catch {
     return false;
   }
@@ -137,7 +143,6 @@ function buildLine(platform, login) {
       ? `https://twitch.tv/${login}`
       : `https://kick.com/${login}`;
 
-  // ✅ بدون إظهار الرابط كامل
   return `**${login}** — [اضغط هنا](${url})`;
 }
 
@@ -147,9 +152,8 @@ function chunkIfTooLong(lines) {
 
   let out = "";
   for (const l of lines) {
-    const next = out ? out + "\n" + l : l;
-    if (next.length > 1000) break;
-    out = next;
+    if ((out + (out ? "\n" : "") + l).length > 1000) break;
+    out += (out ? "\n" : "") + l;
   }
   return out + "\n…";
 }
@@ -199,9 +203,8 @@ async function update(channel) {
   const embed = new EmbedBuilder()
     .setColor(0x7c3aed)
     .setTitle("⭐ ستريمر بلادي")
+    .setThumbnail(EMBED_THUMBNAIL_URL) // ✅ الصورة يمين فوق
     .setDescription(`**الحالة:** ${statusLine}\n**اللايف الآن:** (${totalLiveNow})`)
-    // ✅ الصورة يمين فوق
-    .setThumbnail(THUMB_URL)
     .addFields(
       { name: "🟩 Kick", value: kickValue, inline: true },
       { name: "🟪 Twitch", value: twitchValue, inline: true },
@@ -242,65 +245,66 @@ async function registerCommands() {
     new SlashCommandBuilder()
       .setName("add")
       .setDescription("إضافة ستريمر (Twitch/Kick)")
-      .addStringOption((o) =>
-        o
-          .setName("platform")
+      .addStringOption(o =>
+        o.setName("platform")
           .setDescription("twitch أو kick")
           .setRequired(true)
           .addChoices(
             { name: "twitch", value: "twitch" },
             { name: "kick", value: "kick" }
-          )
-      )
-      .addStringOption((o) =>
-        o
-          .setName("login")
-          .setDescription("اسم القناة (بدون رابط)")
-          .setRequired(true)
-      ),
+          ))
+      .addStringOption(o =>
+        o.setName("login")
+          .setDescription("اسم القناة فقط (بدون رابط)")
+          .setRequired(true)),
 
     new SlashCommandBuilder()
       .setName("remove")
       .setDescription("حذف ستريمر (Twitch/Kick)")
-      .addStringOption((o) =>
-        o
-          .setName("platform")
+      .addStringOption(o =>
+        o.setName("platform")
           .setDescription("twitch أو kick")
           .setRequired(true)
           .addChoices(
             { name: "twitch", value: "twitch" },
             { name: "kick", value: "kick" }
-          )
-      )
-      .addStringOption((o) =>
-        o
-          .setName("login")
+          ))
+      .addStringOption(o =>
+        o.setName("login")
           .setDescription("اسم القناة")
-          .setRequired(true)
-      ),
+          .setRequired(true)),
 
-    new SlashCommandBuilder().setName("list").setDescription("عرض قائمة الستريمرز"),
+    new SlashCommandBuilder()
+      .setName("list")
+      .setDescription("عرض قائمة الستريمرز المسجلين"),
 
     new SlashCommandBuilder()
       .setName("setchannel")
       .setDescription("تحديد الروم اللي ينزل فيه الإشعار")
-      .addStringOption((o) =>
-        o.setName("channel_id").setDescription("آيدي الروم").setRequired(true)
-      ),
+      .addStringOption(o =>
+        o.setName("channel_id")
+          .setDescription("آيدي الروم")
+          .setRequired(true)),
 
-    new SlashCommandBuilder().setName("forceupdate").setDescription("تحديث الآن"),
-  ].map((c) => c.toJSON());
+    new SlashCommandBuilder()
+      .setName("forceupdate")
+      .setDescription("تحديث الإشعار الآن"),
+  ].map(c => c.toJSON());
 
   const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
 
   if (GUILD_ID) {
-    await rest.put(Routes.applicationGuildCommands(DISCORD_CLIENT_ID, GUILD_ID), {
-      body: commands,
-    });
-    console.log("✅ أوامر السلاش سجلت للسيرفر فورًا");
+    await rest.put(
+      Routes.applicationGuildCommands(DISCORD_CLIENT_ID, GUILD_ID),
+      { body: commands }
+    );
+    console.log("✅ Slash Commands (Guild) جاهزة فورًا");
   } else {
-    await rest.put(Routes.applicationCommands(DISCORD_CLIENT_ID), { body: commands });
-    console.log("✅ أوامر السلاش سجلت (Global) وقد تتأخر بالظهور");
+    await rest.put(
+      Routes.applicationCommands(DISCORD_CLIENT_ID),
+      { body: commands }
+    );
+    console.log("✅ Slash Commands (Global) (قد تتأخر بالظهور)");
   }
 }
 
@@ -327,8 +331,7 @@ client.once("ready", async () => {
       console.log("❌ CHANNEL_ID غلط أو ما عنده صلاحية");
     }
   } else {
-    console.log("ℹ️ ما في روم محدد—استخدم /setchannel");
-    setInterval(() => {}, 60_000);
+    console.log("ℹ️ ما في روم محدد. استخدم /setchannel");
   }
 });
 
@@ -340,24 +343,15 @@ client.on("interactionCreate", async (interaction) => {
   if (cmd === "add") {
     const platform = interaction.options.getString("platform", true);
     const loginRaw = interaction.options.getString("login", true);
-
-    // ✅ lowercase مهم لتويتش + شيل مسافات و @
     const login = loginRaw.trim().replace(/^@/, "").replace(/\s+/g, "").toLowerCase();
 
     const arr = state.streamers[platform] || (state.streamers[platform] = []);
     if (arr.includes(login)) {
-      return interaction.reply({
-        content: `⚠️ موجود من قبل: **${login}** على ${platform}`,
-        ephemeral: true,
-      });
+      return interaction.reply({ content: `⚠️ موجود من قبل: **${login}** على ${platform}`, ephemeral: true });
     }
     arr.push(login);
     saveState(state);
-
-    return interaction.reply({
-      content: `✅ تمت الإضافة: **${login}** على ${platform}`,
-      ephemeral: true,
-    });
+    return interaction.reply({ content: `✅ تمت الإضافة: **${login}** على ${platform}\nجرّب الآن: /forceupdate`, ephemeral: true });
   }
 
   if (cmd === "remove") {
@@ -368,18 +362,11 @@ client.on("interactionCreate", async (interaction) => {
     const arr = state.streamers[platform] || [];
     const idx = arr.indexOf(login);
     if (idx === -1) {
-      return interaction.reply({
-        content: `⚠️ غير موجود: **${login}** على ${platform}`,
-        ephemeral: true,
-      });
+      return interaction.reply({ content: `⚠️ غير موجود: **${login}** على ${platform}`, ephemeral: true });
     }
     arr.splice(idx, 1);
     saveState(state);
-
-    return interaction.reply({
-      content: `✅ تم الحذف: **${login}** من ${platform}`,
-      ephemeral: true,
-    });
+    return interaction.reply({ content: `✅ تم الحذف: **${login}** من ${platform}`, ephemeral: true });
   }
 
   if (cmd === "list") {
@@ -393,19 +380,13 @@ client.on("interactionCreate", async (interaction) => {
     state.channelId = chId;
     state.messageId = null;
     saveState(state);
-
     return interaction.reply({ content: `✅ تم تحديد الروم: \`${chId}\``, ephemeral: true });
   }
 
   if (cmd === "forceupdate") {
     const usedChannelId = state.channelId || CHANNEL_ID;
     const channel = await client.channels.fetch(usedChannelId).catch(() => null);
-    if (!channel) {
-      return interaction.reply({
-        content: "❌ ما لقيت الروم. تأكد من CHANNEL_ID أو /setchannel",
-        ephemeral: true,
-      });
-    }
+    if (!channel) return interaction.reply({ content: "❌ ما لقيت الروم. تأكد من CHANNEL_ID أو /setchannel", ephemeral: true });
 
     update(channel).catch(console.error);
     return interaction.reply({ content: "✅ تم التحديث الآن.", ephemeral: true });
