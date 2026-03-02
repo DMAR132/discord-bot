@@ -1,227 +1,210 @@
 require("dotenv").config();
+const fs = require("fs");
+const path = require("path");
+const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
+const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
 
-const { Client, GatewayIntentBits, EmbedBuilder, Events } = require("discord.js");
-const axios = require("axios");
-
-// ===== ENV =====
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+// ✅ من Render Environment
 const CHANNEL_ID = process.env.CHANNEL_ID;
+const INTERVAL_MS = Number(process.env.INTERVAL_MS || 5000);
 
-const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID;
-const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
-
-const TWITCH_LOGINS = (process.env.TWITCH_LOGINS || "")
-  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
-
-const KICK_LOGINS = (process.env.KICK_LOGINS || "")
-  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
-
-function parseMap(str) {
-  const map = new Map();
-  if (!str) return map;
-
-  str.split(",")
+// ✅ يقرأها من Render مثل: shroud,xqc,foo
+function parseList(v) {
+  return (v || "")
+    .split(",")
     .map(s => s.trim())
-    .filter(Boolean)
-    .forEach(p => {
-      const [loginRaw, idRaw] = p.split(":");
-      const login = (loginRaw || "").trim().toLowerCase();
-      const id = (idRaw || "").trim();
-      if (login && id) map.set(login, id);
-    });
-
-  return map;
+    .filter(Boolean);
 }
+const TWITCH_LOGINS = parseList(process.env.TWITCH_LOGINS);
+const KICK_LOGINS = parseList(process.env.KICK_LOGINS);
 
-const TWITCH_MENTION_MAP = parseMap(process.env.TWITCH_MENTION_MAP);
-const KICK_MENTION_MAP = parseMap(process.env.KICK_MENTION_MAP);
+const STATE_FILE = path.join(__dirname, "state.json");
 
-// Emojis (اختياري)
-const TWITCH_EMOJI = (process.env.TWITCH_EMOJI || "🟪").trim();
-const KICK_EMOJI = (process.env.KICK_EMOJI || "🟩").trim();
-
-// صور LIVE/OFFLINE
-const LIVE_BADGE_URL = (process.env.LIVE_BADGE_URL || "").trim();
-const OFFLINE_BADGE_URL = (process.env.OFFLINE_BADGE_URL || "").trim();
-
-// سرعة التحديث
-const UPDATE_EVERY_SECONDS = Number(process.env.UPDATE_EVERY_SECONDS || 15);
-
-// ===== CLIENT =====
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
-let messageId = null;
-
-// Twitch token cache
-let twitchToken = null;
-let tokenExpire = 0;
-
-// عشان ping مرة وحدة لكل بداية لايف
-let prevLive = new Set();
-
-// ===== TWITCH TOKEN =====
-async function getTwitchToken() {
-  if (!TWITCH_CLIENT_ID || !TWITCH_CLIENT_SECRET) return null;
-  if (twitchToken && Date.now() < tokenExpire) return twitchToken;
-
-  const res = await axios.post("https://id.twitch.tv/oauth2/token", null, {
-    params: {
-      client_id: TWITCH_CLIENT_ID,
-      client_secret: TWITCH_CLIENT_SECRET,
-      grant_type: "client_credentials"
+function loadState() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) {
+      const init = { messageId: null, lastLiveKeys: [], counts: { twitch: 0, kick: 0 } };
+      fs.writeFileSync(STATE_FILE, JSON.stringify(init, null, 2));
+      return init;
     }
-  });
+    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  } catch {
+    return { messageId: null, lastLiveKeys: [], counts: { twitch: 0, kick: 0 } };
+  }
+}
+function saveState(st) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(st, null, 2));
+}
+const state = loadState();
 
-  twitchToken = res.data.access_token;
-  tokenExpire = Date.now() + (res.data.expires_in - 60) * 1000;
+// ===== Twitch token cache =====
+let twitchToken = null;
+let twitchTokenExp = 0;
+
+async function getTwitchToken() {
+  const now = Date.now();
+  if (twitchToken && now < twitchTokenExp - 60_000) return twitchToken;
+
+  const url = new URL("https://id.twitch.tv/oauth2/token");
+  url.searchParams.set("client_id", process.env.TWITCH_CLIENT_ID || "");
+  url.searchParams.set("client_secret", process.env.TWITCH_CLIENT_SECRET || "");
+  url.searchParams.set("grant_type", "client_credentials");
+
+  const res = await fetch(url.toString(), { method: "POST" });
+  if (!res.ok) throw new Error("Twitch token failed: " + res.status);
+  const json = await res.json();
+
+  twitchToken = json.access_token;
+  twitchTokenExp = Date.now() + (json.expires_in * 1000);
   return twitchToken;
 }
 
-// ===== CHECK TWITCH =====
-async function checkTwitch(login) {
+async function isTwitchLive(login) {
+  if (!process.env.TWITCH_CLIENT_ID || !process.env.TWITCH_CLIENT_SECRET) return false;
+
+  const token = await getTwitchToken();
+  const url = new URL("https://api.twitch.tv/helix/streams");
+  url.searchParams.set("user_login", login);
+
+  const res = await fetch(url.toString(), {
+    headers: {
+      "Client-ID": process.env.TWITCH_CLIENT_ID,
+      "Authorization": `Bearer ${token}`,
+    },
+  });
+  if (!res.ok) return false;
+  const json = await res.json();
+  return Array.isArray(json.data) && json.data.length > 0;
+}
+
+// Kick (غير رسمي)
+async function isKickLive(channel) {
   try {
-    const token = await getTwitchToken();
-    if (!token) return { live: false };
-
-    const res = await axios.get("https://api.twitch.tv/helix/streams", {
-      params: { user_login: login },
-      headers: {
-        "Client-Id": TWITCH_CLIENT_ID,
-        "Authorization": `Bearer ${token}`
-      }
-    });
-
-    const stream = res.data?.data?.[0];
-    return { live: !!stream };
+    const res = await fetch(`https://kick.com/api/v2/channels/${encodeURIComponent(channel)}`);
+    if (!res.ok) return false;
+    const json = await res.json();
+    return !!json?.livestream;
   } catch {
-    return { live: false };
+    return false;
   }
 }
 
-// ===== CHECK KICK =====
-async function checkKick(login) {
-  try {
-    const res = await axios.get(`https://kick.com/api/v2/channels/${login}`);
-    return { live: !!res.data?.livestream };
-  } catch {
-    return { live: false };
+function buildLine(platform, login) {
+  const url = platform === "twitch"
+    ? `https://twitch.tv/${login}`
+    : `https://kick.com/${login}`;
+
+  return `**${login}** — [اضغط هنا](${url})`;
+}
+
+function chunkIfTooLong(lines) {
+  const joined = lines.join("\n");
+  if (joined.length <= 1024) return joined;
+
+  let out = "";
+  for (const l of lines) {
+    if ((out + (out ? "\n" : "") + l).length > 1000) break;
+    out += (out ? "\n" : "") + l;
   }
+  return out + "\n…";
 }
 
-// ===== Ping مؤقت =====
-async function sendTempPing(channel, userIds) {
-  if (!userIds.length) return;
-
-  const uniq = [...new Set(userIds)];
-  const content = uniq.map(id => `<@${id}>`).join(" ");
-
-  const pingMsg = await channel.send({
-    content,
-    allowedMentions: { users: uniq }
-  }).catch(() => null);
-
-  if (pingMsg) setTimeout(() => pingMsg.delete().catch(() => {}), 5000);
-}
-
-// ===== UPDATE =====
 async function update(channel) {
-  let twitchLiveCount = 0;
-  let kickLiveCount = 0;
-
-  const twitchMentions = [];
-  const kickMentions = [];
-
-  const allMentionIds = [];
-  const currentLive = new Set();
-  const newPingUsers = [];
+  const currentLiveKeys = new Set();
+  const liveTwitch = [];
+  const liveKick = [];
 
   // Twitch
   for (const login of TWITCH_LOGINS) {
-    const d = await checkTwitch(login);
-    if (!d.live) continue;
+    const live = await isTwitchLive(login);
+    if (!live) continue;
 
-    twitchLiveCount++;
     const key = `twitch:${login}`;
-    currentLive.add(key);
+    currentLiveKeys.add(key);
 
-    const id = TWITCH_MENTION_MAP.get(login);
-    if (id) {
-      twitchMentions.push(`<@${id}>`);
-      allMentionIds.push(id);
-      if (!prevLive.has(key)) newPingUsers.push(id);
+    liveTwitch.push(buildLine("twitch", login));
+
+    if (!state.lastLiveKeys.includes(key)) {
+      state.counts.twitch = (state.counts.twitch || 0) + 1;
     }
   }
 
   // Kick
   for (const login of KICK_LOGINS) {
-    const d = await checkKick(login);
-    if (!d.live) continue;
+    const live = await isKickLive(login);
+    if (!live) continue;
 
-    kickLiveCount++;
     const key = `kick:${login}`;
-    currentLive.add(key);
+    currentLiveKeys.add(key);
 
-    const id = KICK_MENTION_MAP.get(login);
-    if (id) {
-      kickMentions.push(`<@${id}>`);
-      allMentionIds.push(id);
-      if (!prevLive.has(key)) newPingUsers.push(id);
+    liveKick.push(buildLine("kick", login));
+
+    if (!state.lastLiveKeys.includes(key)) {
+      state.counts.kick = (state.counts.kick || 0) + 1;
     }
   }
 
-  // ping فوري لأول ما يفتح
-  await sendTempPing(channel, newPingUsers);
+  const totalLiveNow = liveTwitch.length + liveKick.length;
+  const statusLine = totalLiveNow > 0 ? "🟢 ONLINE" : "⚪ OFFLINE";
 
-  prevLive = currentLive;
-
-  const totalLive = kickLiveCount + twitchLiveCount;
-  const live = totalLive > 0;
-
-  // داخل نفس المربع: رقم ثم خط ثم منشنات
-  let kickValue = `${kickLiveCount}\n—`;
-  if (kickMentions.length) kickValue += `\n${kickMentions.join("\n")}`;
-
-  let twitchValue = `${twitchLiveCount}\n—`;
-  if (twitchMentions.length) twitchValue += `\n${twitchMentions.join("\n")}`;
+  const kickValue = liveKick.length ? chunkIfTooLong(liveKick) : "—";
+  const twitchValue = liveTwitch.length ? chunkIfTooLong(liveTwitch) : "—";
 
   const embed = new EmbedBuilder()
-    .setTitle("⭐ مراقب ستريمر")
+    .setColor(0x7c3aed)
+    .setTitle("⭐ ستريمر بلادي")
+    .setDescription(`**الحالة:** ${statusLine}\n**اللايف الآن:** (${totalLiveNow})`)
     .addFields(
-      { name: "⭐ ستريمر", value: "\u200b", inline: true },
-      { name: "\u200b", value: live ? "🔴 LIVE" : "⚫ OFFLINE", inline: true },
-      { name: "عدد الستريمر الحالي:", value: `(${totalLive})`, inline: false },
-      { name: `${KICK_EMOJI} Kick:`, value: kickValue, inline: false },
-      { name: `${TWITCH_EMOJI} Twitch:`, value: twitchValue, inline: false }
+      { name: "🟩 Kick", value: kickValue, inline: true },
+      { name: "🟪 Twitch", value: twitchValue, inline: true },
+      {
+        name: "\u200b",
+        value: `**عدد مرات فتح لايف (من وقت تشغيل البوت):**\nKick: ${state.counts.kick || 0} | Twitch: ${state.counts.twitch || 0}`,
+        inline: false
+      },
     )
-    .setTimestamp(new Date());
+    .setTimestamp();
 
-  const img = live ? LIVE_BADGE_URL : OFFLINE_BADGE_URL;
-  if (img && img.startsWith("http")) embed.setThumbnail(img);
+  state.lastLiveKeys = Array.from(currentLiveKeys);
+  saveState(state);
 
-  const payload = {
-    content: "",
-    embeds: [embed],
-    // عشان المنشن يطلع “mention” مو نص عادي
-    allowedMentions: { users: [...new Set(allMentionIds)], parse: [] }
-  };
-
-  if (messageId) {
-    const msg = await channel.messages.fetch(messageId).catch(() => null);
-    if (msg) return msg.edit(payload).catch(() => {});
+  if (state.messageId) {
+    const old = await channel.messages.fetch(state.messageId).catch(() => null);
+    if (old) {
+      await old.edit({ embeds: [embed] }).catch(() => {});
+      return;
+    }
   }
 
-  const msg = await channel.send(payload).catch(() => null);
-  if (msg) messageId = msg.id;
+  const sent = await channel.send({ embeds: [embed] }).catch(() => null);
+  if (sent) {
+    state.messageId = sent.id;
+    saveState(state);
+  }
 }
 
-// ===== READY =====
-client.on(Events.ClientReady, async () => {
-  console.log("✅ Bot ready");
-  const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
-  if (!channel) return console.log("❌ Wrong CHANNEL_ID or no access");
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-  await update(channel);
-  setInterval(() => update(channel), UPDATE_EVERY_SECONDS * 1000);
+client.once("ready", async () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
+
+  if (!process.env.DISCORD_TOKEN) {
+    console.log("❌ ناقص DISCORD_TOKEN");
+    process.exit(1);
+  }
+  if (!CHANNEL_ID) {
+    console.log("❌ ناقص CHANNEL_ID");
+    process.exit(1);
+  }
+
+  const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
+  if (!channel) {
+    console.log("❌ CHANNEL_ID غلط أو ما عنده صلاحية");
+    process.exit(1);
+  }
+
+  update(channel).catch(console.error);
+  setInterval(() => update(channel).catch(console.error), INTERVAL_MS);
 });
 
-client.login(DISCORD_TOKEN);
+client.login(process.env.DISCORD_TOKEN);
