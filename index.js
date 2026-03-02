@@ -1,4 +1,13 @@
 require("dotenv").config();
+
+// ✅ Web server بسيط عشان Render ما يعمل Timeout (Web Service يحتاج PORT)
+const express = require("express");
+const app = express();
+app.get("/", (req, res) => res.send("Bot is running"));
+app.listen(process.env.PORT || 3000, () => {
+  console.log("🌐 Web server running");
+});
+
 const fs = require("fs");
 const path = require("path");
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
@@ -29,20 +38,17 @@ function loadState() {
         messageId: null,
         lastLiveKeys: [],
         counts: { twitch: 0, kick: 0 },
-        streamers: { twitch: [], kick: [] },  // ✅ القوائم صارت هنا
-        channelId: CHANNEL_ID || null,        // ✅ نخزن الروم
+        streamers: { twitch: [], kick: [] },
+        channelId: CHANNEL_ID || null,
       };
       fs.writeFileSync(STATE_FILE, JSON.stringify(init, null, 2));
       return init;
     }
     const st = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-
-    // ترقيع لو state قديم
     st.counts ||= { twitch: 0, kick: 0 };
     st.lastLiveKeys ||= [];
     st.streamers ||= { twitch: [], kick: [] };
     st.channelId ||= CHANNEL_ID || null;
-
     return st;
   } catch {
     return {
@@ -117,7 +123,6 @@ function buildLine(platform, login) {
     ? `https://twitch.tv/${login}`
     : `https://kick.com/${login}`;
 
-  // ✅ بدون رابط كامل
   return `**${login}** — [اضغط هنا](${url})`;
 }
 
@@ -141,7 +146,6 @@ async function update(channel) {
   const TWITCH_LOGINS = state.streamers.twitch || [];
   const KICK_LOGINS = state.streamers.kick || [];
 
-  // Twitch
   for (const login of TWITCH_LOGINS) {
     const live = await isTwitchLive(login);
     if (!live) continue;
@@ -155,7 +159,6 @@ async function update(channel) {
     }
   }
 
-  // Kick
   for (const login of KICK_LOGINS) {
     const live = await isKickLive(login);
     if (!live) continue;
@@ -308,7 +311,6 @@ client.once("ready", async () => {
       console.log("❌ CHANNEL_ID غلط أو ما عنده صلاحية");
     }
   } else {
-    // ما في روم محدد—البوت ينتظر /setchannel
     setInterval(() => {}, 60_000);
   }
 });
@@ -329,7 +331,6 @@ client.on("interactionCreate", async (interaction) => {
     }
     arr.push(login);
     saveState(state);
-
     return interaction.reply({ content: `✅ تمت الإضافة: **${login}** على ${platform}`, ephemeral: true });
   }
 
@@ -345,25 +346,20 @@ client.on("interactionCreate", async (interaction) => {
     }
     arr.splice(idx, 1);
     saveState(state);
-
     return interaction.reply({ content: `✅ تم الحذف: **${login}** من ${platform}`, ephemeral: true });
   }
 
   if (cmd === "list") {
     const t = (state.streamers.twitch || []).join(", ") || "—";
     const k = (state.streamers.kick || []).join(", ") || "—";
-    return interaction.reply({
-      content: `**Twitch:** ${t}\n**Kick:** ${k}`,
-      ephemeral: true
-    });
+    return interaction.reply({ content: `**Twitch:** ${t}\n**Kick:** ${k}`, ephemeral: true });
   }
 
   if (cmd === "setchannel") {
     const chId = interaction.options.getString("channel_id", true).trim();
     state.channelId = chId;
-    state.messageId = null; // عشان يرسل رسالة جديدة في الروم الجديد
+    state.messageId = null;
     saveState(state);
-
     return interaction.reply({ content: `✅ تم تحديد الروم: \`${chId}\``, ephemeral: true });
   }
 
