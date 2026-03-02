@@ -55,27 +55,6 @@ process.on("uncaughtException", (err) => {
   console.error(err);
 });
 
-// ====== helpers ======
-async function safeDefer(interaction, opts = { ephemeral: true }) {
-  try {
-    if (!interaction.deferred && !interaction.replied) {
-      await interaction.deferReply(opts);
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function safeReply(interaction, payload) {
-  try {
-    if (interaction.deferred || interaction.replied) return await interaction.editReply(payload);
-    return await interaction.reply(payload);
-  } catch {
-    return null;
-  }
-}
-
 const STATE_FILE = path.join(__dirname, "state.json");
 
 // ====== State (single message control) ======
@@ -383,30 +362,51 @@ client.once("ready", async () => {
   }
 });
 
+// ✅ NO deferReply anymore (fix 10062)
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   const cmd = interaction.commandName;
 
+  async function quickAck(ephemeral = true) {
+    try {
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: "⏳ جاري التنفيذ...", ephemeral });
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function safeEdit(content, ephemeral = true) {
+    try {
+      if (interaction.deferred || interaction.replied) {
+        return await interaction.editReply({ content, ephemeral });
+      }
+      return await interaction.reply({ content, ephemeral });
+    } catch {
+      return null;
+    }
+  }
+
   if (cmd === "add") {
-    await safeDefer(interaction, { ephemeral: true });
+    await quickAck(true);
 
     const platform = interaction.options.getString("platform", true);
     const loginRaw = interaction.options.getString("login", true);
     const login = loginRaw.trim().replace(/^@/, "").replace(/\s+/g, "").toLowerCase();
 
     const arr = state.streamers[platform] || (state.streamers[platform] = []);
-    if (arr.includes(login)) {
-      return safeReply(interaction, { content: `⚠️ موجود من قبل: **${login}** على ${platform}`, ephemeral: true });
-    }
+    if (arr.includes(login)) return safeEdit(`⚠️ موجود من قبل: **${login}** على ${platform}`, true);
 
     arr.push(login);
     saveState(state);
-    return safeReply(interaction, { content: `✅ تمت الإضافة: **${login}** على ${platform}\nجرّب الآن: /forceupdate`, ephemeral: true });
+    return safeEdit(`✅ تمت الإضافة: **${login}** على ${platform}\nجرّب الآن: /forceupdate`, true);
   }
 
   if (cmd === "remove") {
-    await safeDefer(interaction, { ephemeral: true });
+    await quickAck(true);
 
     const platform = interaction.options.getString("platform", true);
     const loginRaw = interaction.options.getString("login", true);
@@ -414,19 +414,17 @@ client.on("interactionCreate", async (interaction) => {
 
     const arr = state.streamers[platform] || [];
     const idx = arr.indexOf(login);
-    if (idx === -1) {
-      return safeReply(interaction, { content: `⚠️ غير موجود: **${login}** على ${platform}`, ephemeral: true });
-    }
+    if (idx === -1) return safeEdit(`⚠️ غير موجود: **${login}** على ${platform}`, true);
 
     arr.splice(idx, 1);
     saveState(state);
-    return safeReply(interaction, { content: `✅ تم الحذف: **${login}** من ${platform}`, ephemeral: true });
+    return safeEdit(`✅ تم الحذف: **${login}** من ${platform}`, true);
   }
 
   if (cmd === "list") {
     const t = (state.streamers.twitch || []).join(", ") || "—";
     const k = (state.streamers.kick || []).join(", ") || "—";
-    return safeReply(interaction, { content: `**Twitch:** ${t}\n**Kick:** ${k}`, ephemeral: true });
+    return safeEdit(`**Twitch:** ${t}\n**Kick:** ${k}`, true);
   }
 
   if (cmd === "setchannel") {
@@ -434,18 +432,18 @@ client.on("interactionCreate", async (interaction) => {
     state.channelId = chId;
     state.messageId = null;
     saveState(state);
-    return safeReply(interaction, { content: `✅ تم تحديد الروم: \`${chId}\``, ephemeral: true });
+    return safeEdit(`✅ تم تحديد الروم: \`${chId}\``, true);
   }
 
   if (cmd === "forceupdate") {
-    await safeDefer(interaction, { ephemeral: true });
+    await quickAck(true);
 
     const usedChannelId = state.channelId || CHANNEL_ID;
     const channel = await client.channels.fetch(usedChannelId).catch(() => null);
-    if (!channel) return safeReply(interaction, { content: "❌ ما لقيت الروم. تأكد من CHANNEL_ID أو /setchannel", ephemeral: true });
+    if (!channel) return safeEdit("❌ ما لقيت الروم. تأكد من CHANNEL_ID أو /setchannel", true);
 
     await update(channel).catch(console.error);
-    return safeReply(interaction, { content: "✅ تم التحديث الآن.", ephemeral: true });
+    return safeEdit("✅ تم التحديث الآن.", true);
   }
 });
 
